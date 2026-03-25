@@ -1,0 +1,6 @@
+DATABASE_URL = "postgresql://postgres:Pranav@1590@localhost:5432/disasterfusion"
+SECRET_KEY = "supersecretkey"
+ALGORITHM = "HS256"
+TOMORROW_API_KEY = "VghmdJTn6kbSpa2ElTQpaVbaez89NgM5"
+WEATHERAPI_KEY = "YOUR_KEY"
+WAQI_KEY = "YOUR_KEY"
