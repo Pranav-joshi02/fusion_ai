@@ -1,4 +1,4 @@
-DATABASE_URL = "postgresql://postgres:Pranav@1590@localhost:5432/disasterfusion"
+DATABASE_URL = "sqlite:///./test.db"
 SECRET_KEY = "supersecretkey"
 ALGORITHM = "HS256"
 TOMORROW_API_KEY = "VghmdJTn6kbSpa2ElTQpaVbaez89NgM5"

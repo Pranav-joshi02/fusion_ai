@@ -1,83 +1,141 @@
 import asyncio
+import time
 from datetime import datetime, timedelta
-
-from app.services.tomorrow_service import get_tomorrow_weather
-from app.services.weatherapi_service import get_weatherapi
+import uuid
+from app.services.weather_service import get_weather
 from app.services.waqi_service import get_aqi
 from app.services.earthquake_service import get_earthquakes
-from app.services.nasa_service import get_fires
 from app.services.gdacs_service import get_gdacs
-from app.services.fusion_engine import merge_weather, detect
-
+from app.services.ml_model import predict_ml
+from app.services.mock_data import generate_mock_weather, generate_mock_aqi
+from app.services.fusion_engine import detect
+from app.services.mock_data import generate_mock_prediction
 from app.models.event import Event
 
 
-# ⚡ OPTIONAL: import websocket connections
+# ── Location names ─────────────────────────────────────────────
+LOCATION_MAP = {
+    (19.07, 72.87):   "Mumbai, India",
+    (28.61, 77.20):   "Delhi, India",
+    (34.05, -118.24): "Los Angeles, USA",
+}
+
+def _location_name(lat, lng):
+    for (la, lo), name in LOCATION_MAP.items():
+        if abs(la - lat) < 1.5 and abs(lo - lng) < 1.5:
+            return name
+    return f"{lat:.2f},{lng:.2f}"
+
+
+# ── WebSocket pools ────────────────────────────────────────────
 try:
-    from app.main import active_connections
+    from app.main import active_connections, active_prediction_connections
 except:
     active_connections = []
+    active_prediction_connections = []
 
 
-# 🧠 DEDUP CHECK
+# ── Helpers ────────────────────────────────────────────────────
 def is_duplicate(db, lat, lng, event_type):
     recent_time = datetime.utcnow() - timedelta(minutes=10)
 
-    existing = db.query(Event).filter(
+    return db.query(Event).filter(
         Event.type == event_type,
         Event.latitude.between(lat - 0.5, lat + 0.5),
         Event.longitude.between(lng - 0.5, lng + 0.5),
         Event.timestamp >= recent_time
     ).first()
 
-    return existing
 
-
-# ⭐ CONFIDENCE CALCULATION
 def calculate_confidence(base, sources=1):
     return min(base + sources * 5, 100)
 
 
-# 📡 WEBSOCKET BROADCAST
-async def broadcast(events):
-    for conn in active_connections:
+async def _broadcast(pool, payload):
+    for conn in list(pool):
         try:
-            await conn.send_json(events)
+            await conn.send_json(payload)
         except:
             pass
-
-
-# 🔄 MAIN PIPELINE
 def run_pipeline(db):
 
     events_payload = []
+    predictions_payload = []
 
     locations = [
-        (19.07, 72.87),   # Mumbai
-        (28.61, 77.20),   # Delhi
-        (34.05, -118.24), # LA
+        (19.07, 72.87),
+        (28.61, 77.20),
+        (34.05, -118.24),
     ]
 
-    # 🌦️ WEATHER + AQI BASED DETECTION
     for lat, lng in locations:
+        loc = _location_name(lat, lng)
+
+        # your existing logic...
+
+        # 🧪 ADD MOCK HERE (INSIDE LOOP)
+        mock_pred = generate_mock_prediction(lat, lng, loc)
+        predictions_payload.append(mock_pred)
+
+def _event_dict(event, location):
+    return {
+        "id": str(event.id),
+        "type": event.type,
+        "category": event.category,
+        "source": event.source,
+        "latitude": event.latitude,
+        "longitude": event.longitude,
+        "severity": event.severity,
+        "confidence": event.confidence,
+        "location": location,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+# ── MAIN PIPELINE ──────────────────────────────────────────────
+def run_pipeline(db):
+
+    events_payload = []
+    predictions_payload = []
+
+    locations = [
+        (19.07, 72.87),
+        (28.61, 77.20),
+        (34.05, -118.24),
+    ]
+
+    # ── WEATHER + ML ───────────────────────────────────────────
+    for lat, lng in locations:
+        loc = _location_name(lat, lng)
+
         try:
-            t1 = get_tomorrow_weather(lat, lng)
-            t2 = get_weatherapi(lat, lng)
+            # 🌦️ WEATHER (STABLE API)
+            weather = get_weather(lat, lng)
 
-            weather = merge_weather(t1, t2)
-            aqi = get_aqi(lat, lng)
+            if weather:
+                source_type = "real"
+            else:
+                print(f"⚠️ Using MOCK weather for {loc}")
+                weather = generate_mock_weather()
+                source_type = "mock"
 
-            detected = detect(weather, aqi)
+            # 🌫️ AQI
+            try:
+                aqi = get_aqi(lat, lng)
+                if not aqi:
+                    raise Exception("Empty AQI")
+            except:
+                print(f"⚠️ Using MOCK AQI for {loc}")
+                aqi = generate_mock_aqi()
 
-            for d in detected:
-                event_type, category, severity = d
-
+            # 🔥 RULE-BASED DETECTION
+            for event_type, category, severity in detect(weather, aqi):
                 if is_duplicate(db, lat, lng, event_type):
                     continue
 
                 confidence = calculate_confidence(70, 2)
 
-                event = Event(
+                ev = Event(
                     type=event_type,
                     category=category,
                     source="fusion",
@@ -86,126 +144,118 @@ def run_pipeline(db):
                     severity=severity,
                     confidence=confidence,
                     status="active",
-                    timestamp=datetime.utcnow()
+                    timestamp=datetime.utcnow(),
                 )
 
-                db.add(event)
+                db.add(ev)
+                events_payload.append(_event_dict(ev, loc))
 
-                events_payload.append({
-                    "id": str(event.id),
-                    "type": event.type,
-                    "category": event.category,
-                    "latitude": event.latitude,
-                    "longitude": event.longitude,
-                    "severity": event.severity,
-                    "confidence": event.confidence
-                })
+            # 🤖 ML PREDICTION
+            ml_label, ml_conf = predict_ml(weather, aqi)
+
+            predictions_payload.append({
+    "id": str(uuid.uuid4()),  # ✅ CRITICAL FIX
+    "location": loc,
+    "latitude": lat,
+    "longitude": lng,
+    "prediction": ml_label,
+    "confidence": round(ml_conf * 100, 1),
+    "weather": weather,
+    "aqi": aqi,
+    "data_source": source_type,
+    "timestamp": datetime.utcnow().isoformat(),
+})
+
+            # 🧠 Convert ML → Event
+            if ml_label not in ["none", "uncertain"] and ml_conf > 0.5:
+                ev = Event(
+                    type=ml_label,
+                    category="predicted",
+                    source="ml",
+                    latitude=lat,
+                    longitude=lng,
+                    severity="high" if ml_conf > 0.7 else "moderate",
+                    confidence=int(ml_conf * 100),
+                    status="active",
+                    timestamp=datetime.utcnow(),
+                )
+
+                db.add(ev)
+                events_payload.append(_event_dict(ev, loc))
+
+            # ⏱️ Prevent rate limit
+            time.sleep(1)
 
         except Exception as e:
-            print("Weather pipeline error:", e)
+            print(f"❌ Pipeline error [{lat},{lng}]:", e)
 
-    # 🌍 EARTHQUAKES (USGS)
+    # ── EARTHQUAKES ────────────────────────────────────────────
     try:
         for eq in get_earthquakes():
-            if is_duplicate(db, eq["lat"], eq["lng"], eq["type"]):
+            lat = eq.get("lat") or eq.get("latitude")
+            lng = eq.get("lng") or eq.get("longitude")
+
+            if lat is None or lng is None:
                 continue
 
-            event = Event(
+            if is_duplicate(db, lat, lng, eq["type"]):
+                continue
+
+            ev = Event(
                 type=eq["type"],
                 category="sudden",
                 source="usgs",
-                latitude=eq["lat"],
-                longitude=eq["lng"],
+                latitude=lat,
+                longitude=lng,
                 severity=eq["severity"],
                 confidence=eq["confidence"],
                 status="active",
-                timestamp=datetime.utcnow()
+                timestamp=datetime.utcnow(),
             )
 
-            db.add(event)
-
-            events_payload.append({
-                "id": str(event.id),
-                "type": event.type,
-                "category": event.category,
-                "latitude": event.latitude,
-                "longitude": event.longitude,
-                "severity": event.severity,
-                "confidence": event.confidence
-            })
+            db.add(ev)
+            events_payload.append(_event_dict(ev, _location_name(lat, lng)))
 
     except Exception as e:
         print("Earthquake error:", e)
 
-    # 🔥 WILDFIRES (NASA)
-    try:
-        for f in get_fires():
-            if is_duplicate(db, f["lat"], f["lng"], f["type"]):
-                continue
-
-            event = Event(
-                type=f["type"],
-                category="sudden",
-                source="nasa",
-                latitude=f["lat"],
-                longitude=f["lng"],
-                severity=f["severity"],
-                confidence=f["confidence"],
-                status="active",
-                timestamp=datetime.utcnow()
-            )
-
-            db.add(event)
-
-            events_payload.append({
-                "id": str(event.id),
-                "type": event.type,
-                "category": event.category,
-                "latitude": event.latitude,
-                "longitude": event.longitude,
-                "severity": event.severity,
-                "confidence": event.confidence
-            })
-
-    except Exception as e:
-        print("NASA error:", e)
-
-    # 🌍 GDACS ALERTS
+    # ── GDACS GLOBAL ALERTS ────────────────────────────────────
     try:
         for g in get_gdacs():
-            if is_duplicate(db, g["latitude"], g["longitude"], g["type"]):
+            lat = g.get("latitude")
+            lng = g.get("longitude")
+
+            if lat is None or lng is None:
                 continue
 
-            event = Event(
+            ev = Event(
                 type=g["type"],
                 category="sudden",
                 source="gdacs",
-                latitude=g["latitude"],
-                longitude=g["longitude"],
+                latitude=lat,
+                longitude=lng,
                 severity=g["severity"],
                 confidence=g["confidence"],
                 status="active",
-                timestamp=datetime.utcnow()
+                timestamp=datetime.utcnow(),
             )
 
-            db.add(event)
-
-            events_payload.append({
-                "id": str(event.id),
-                "type": event.type,
-                "category": event.category,
-                "latitude": event.latitude,
-                "longitude": event.longitude,
-                "severity": event.severity,
-                "confidence": event.confidence
-            })
+            db.add(ev)
+            events_payload.append(_event_dict(ev, _location_name(lat, lng)))
 
     except Exception as e:
         print("GDACS error:", e)
 
-    # 💾 SAVE
+    # ── SAVE + BROADCAST ───────────────────────────────────────
     db.commit()
 
-    # ⚡ REAL-TIME PUSH
     if events_payload:
-        asyncio.run(broadcast(events_payload))
+        asyncio.run(_broadcast(active_connections, events_payload))
+
+    # 🔥 TEMP FIX: send predictions through EVENTS socket
+    asyncio.run(_broadcast(active_connections, predictions_payload))
+
+    print(
+        f"[pipeline] {datetime.utcnow().strftime('%H:%M:%S')} — "
+        f"{len(events_payload)} events, {len(predictions_payload)} predictions"
+    )

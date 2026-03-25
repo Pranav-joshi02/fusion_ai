@@ -1,18 +1,27 @@
 import requests
 
 def get_fires():
-    url = "https://firms.modaps.eosdis.nasa.gov/api/countries/VIIRS_SNPP_NRT/IND/1.json"
-    data = requests.get(url).json()
+    try:
+        url = "https://firms.modaps.eosdis.nasa.gov/api/countries/VIIRS_SNPP_NRT/IND/1.json"
+        res = requests.get(url)
 
-    return [
-        {
-            "type": "wildfire",
-            "category": "sudden",
-            "source": "nasa",
-            "latitude": f["latitude"],
-            "longitude": f["longitude"],
-            "severity": "high",
-            "confidence": 85
-        }
-        for f in data
-    ]
+        if res.status_code != 200:
+            print("NASA API failed")
+            return []
+
+        data = res.json()
+
+        return [
+            {
+                "type": "wildfire",
+                "lat": f.get("latitude"),
+                "lng": f.get("longitude"),
+                "severity": "high",
+                "confidence": 85
+            }
+            for f in data if "latitude" in f
+        ]
+
+    except Exception as e:
+        print("NASA error:", e)
+        return []
